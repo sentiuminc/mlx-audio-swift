@@ -12,6 +12,21 @@ private func rotateHalf(_ x: MLXArray) -> MLXArray {
     return concatenated([-x2, x1], axis: -1)
 }
 
+/// Compile-safe rotateHalf: roll + sign mask instead of shape-dependent slicing.
+/// rotateHalf([a,b,c, d,e,f]) = [-d,-e,-f, a,b,c] = roll(x, D/2) * [-1,-1,-1, 1,1,1]
+private func rotateHalfCompileSafe(_ x: MLXArray, signMask: MLXArray) -> MLXArray {
+    let half = x.dim(-1) / 2
+    return roll(x, shift: half, axis: -1) * signMask
+}
+
+/// Build the sign mask for compile-safe rotateHalf: [-1,...,-1, 1,...,1]
+func makeRotateHalfSignMask(headDim: Int, dtype: DType) -> MLXArray {
+    let half = headDim / 2
+    let neg = MLXArray.ones([half]) * MLXArray(Float(-1.0))
+    let pos = MLXArray.ones([half])
+    return concatenated([neg, pos], axis: 0).asType(dtype)
+}
+
 private func applyRotaryPosEmb(
     _ q: MLXArray, _ k: MLXArray, cos cosVal: MLXArray, sin sinVal: MLXArray
 ) -> (MLXArray, MLXArray) {
@@ -19,6 +34,17 @@ private func applyRotaryPosEmb(
     let sinE = expandedDimensions(sinVal, axis: 1)
     let qEmbed = q * cosE + rotateHalf(q) * sinE
     let kEmbed = k * cosE + rotateHalf(k) * sinE
+    return (qEmbed, kEmbed)
+}
+
+/// Compile-safe variant that avoids shape-dependent Slice operations.
+private func applyRotaryPosEmbCompileSafe(
+    _ q: MLXArray, _ k: MLXArray, cos cosVal: MLXArray, sin sinVal: MLXArray, signMask: MLXArray
+) -> (MLXArray, MLXArray) {
+    let cosE = expandedDimensions(cosVal, axis: 1)
+    let sinE = expandedDimensions(sinVal, axis: 1)
+    let qEmbed = q * cosE + rotateHalfCompileSafe(q, signMask: signMask) * sinE
+    let kEmbed = k * cosE + rotateHalfCompileSafe(k, signMask: signMask) * sinE
     return (qEmbed, kEmbed)
 }
 
@@ -183,6 +209,41 @@ final class TalkerAttention: Module {
 
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, seqLen, -1))
     }
+
+    /// Raw-cache variant for compiled path. Bypasses KVCache protocol.
+    /// Uses compile-safe RoPE (roll + sign mask instead of slicing).
+    func stepWithRawCache(
+        _ x: MLXArray,
+        positionEmbeddings: (MLXArray, MLXArray),
+        signMask: MLXArray,
+        existingKeys: MLXArray,
+        existingValues: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (batch, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
+
+        var q = qProj(x).reshaped(batch, seqLen, numHeads, headDim)
+        var k = kProj(x).reshaped(batch, seqLen, numKvHeads, headDim)
+        var v = vProj(x).reshaped(batch, seqLen, numKvHeads, headDim)
+
+        q = qNorm(q)
+        k = kNorm(k)
+
+        q = q.transposed(0, 2, 1, 3)
+        k = k.transposed(0, 2, 1, 3)
+        v = v.transposed(0, 2, 1, 3)
+
+        let (cosVal, sinVal) = positionEmbeddings
+        (q, k) = applyRotaryPosEmb(q, k, cos: cosVal, sin: sinVal)
+
+        let newKeys = concatenated([existingKeys, k], axis: 2)
+        let newValues = concatenated([existingValues, v], axis: 2)
+
+        let output = MLXFast.scaledDotProductAttention(
+            queries: q, keys: newKeys, values: newValues, scale: scale, mask: nil
+        )
+
+        return (oProj(output.transposed(0, 2, 1, 3).reshaped(batch, seqLen, -1)), newKeys, newValues)
+    }
 }
 
 // MARK: - Talker MLP (SwiGLU)
@@ -244,6 +305,26 @@ final class TalkerDecoderLayer: Module {
         out = out + mlp(postAttentionLayernorm(out))
         return out
     }
+
+    /// Raw-cache variant for compiled path.
+    func stepWithRawCache(
+        _ x: MLXArray,
+        positionEmbeddings: (MLXArray, MLXArray),
+        signMask: MLXArray,
+        existingKeys: MLXArray,
+        existingValues: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (attnOut, newK, newV) = selfAttn.stepWithRawCache(
+            inputLayernorm(x),
+            positionEmbeddings: positionEmbeddings,
+            signMask: signMask,
+            existingKeys: existingKeys,
+            existingValues: existingValues
+        )
+        let out = x + attnOut
+        let finalOut = out + mlp(postAttentionLayernorm(out))
+        return (finalOut, newK, newV)
+    }
 }
 
 // MARK: - Talker Model (inner)
@@ -304,6 +385,37 @@ final class Qwen3TTSTalkerModel: Module {
         return norm(x)
     }
 
+    /// Raw-cache generation step for compiled path.
+    /// Takes offset as MLXArray (not Int) so compile treats it as a variable.
+    func stepWithRawCache(
+        _ inputsEmbeds: MLXArray,
+        offset: MLXArray,
+        signMask: MLXArray,
+        kvPairs: [(MLXArray, MLXArray)]
+    ) -> (MLXArray, [(MLXArray, MLXArray)]) {
+        let (batch, seqLen, _) = (inputsEmbeds.dim(0), inputsEmbeds.dim(1), inputsEmbeds.dim(2))
+
+        let pos = expandedDimensions(offset, axis: 0).reshaped(1, seqLen)
+        let bpos = broadcast(pos, to: [batch, seqLen])
+        let posIds = stacked([bpos, bpos, bpos], axis: 0)
+        let posEmbeddings = rotaryEmb(inputsEmbeds, positionIds: posIds)
+
+        var x = inputsEmbeds
+        var newKVPairs = [(MLXArray, MLXArray)]()
+        for (i, layer) in layers.enumerated() {
+            let (out, newK, newV) = layer.stepWithRawCache(
+                x,
+                positionEmbeddings: posEmbeddings,
+                signMask: signMask,
+                existingKeys: kvPairs[i].0,
+                existingValues: kvPairs[i].1
+            )
+            x = out
+            newKVPairs.append((newK, newV))
+        }
+        return (norm(x), newKVPairs)
+    }
+
     func makeCache() -> [any KVCache] {
         layers.map { _ in KVCacheSimple() }
     }
@@ -352,6 +464,20 @@ final class Qwen3TTSTalkerForConditionalGeneration: Module {
 
     func makeCache() -> [any KVCache] {
         model.makeCache()
+    }
+
+    /// Raw-cache generation step for compiled path.
+    func stepWithRawCache(
+        _ inputsEmbeds: MLXArray,
+        offset: MLXArray,
+        signMask: MLXArray,
+        kvPairs: [(MLXArray, MLXArray)]
+    ) -> (MLXArray, MLXArray, [(MLXArray, MLXArray)]) {
+        let (hiddenStates, newKVPairs) = model.stepWithRawCache(
+            inputsEmbeds, offset: offset, signMask: signMask, kvPairs: kvPairs
+        )
+        let logits = codecHead(hiddenStates)
+        return (logits, hiddenStates, newKVPairs)
     }
 
     static func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

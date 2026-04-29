@@ -25,6 +25,9 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     private let inputPreparationCacheLock = NSLock()
     private var cachedReferenceAudioContext: ReferenceAudioContext?
 
+    /// Compiled talker generation step (full transformer + codec head).
+    private var compiledTalkerStep: (([MLXArray]) -> [MLXArray])?
+
     public var sampleRate: Int { config.sampleRate }
 
     public var defaultGenerationParameters: GenerateParameters {
@@ -58,6 +61,21 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
+        try await generate(
+            text: text, voice: voice, refAudio: refAudio, refText: refText,
+            language: language, generationParameters: generationParameters, codebooks: 16
+        )
+    }
+
+    public func generate(
+        text: String,
+        voice: String?,
+        refAudio: MLXArray?,
+        refText: String?,
+        language: String?,
+        generationParameters: GenerateParameters,
+        codebooks: Int
+    ) async throws -> MLXArray {
         try requireGenerationComponents()
         let settings = resolveVoiceDesignGenerationSettings(
             language: language,
@@ -75,7 +93,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             topP: settings.topP,
             repetitionPenalty: settings.repetitionPenalty,
             minP: settings.minP,
-            maxTokens: settings.maxTokens
+            maxTokens: settings.maxTokens,
+            codebooks: codebooks
         )
     }
 
@@ -94,7 +113,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refText: refText,
             language: language,
             generationParameters: generationParameters,
-            streamingInterval: 2.0
+            streamingInterval: 2.0,
+            codebooks: 16
         )
     }
 
@@ -106,6 +126,28 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         language: String?,
         generationParameters: GenerateParameters,
         streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        generateStream(
+            text: text,
+            voice: voice,
+            refAudio: refAudio,
+            refText: refText,
+            language: language,
+            generationParameters: generationParameters,
+            streamingInterval: streamingInterval,
+            codebooks: 16
+        )
+    }
+
+    public func generateStream(
+        text: String,
+        voice: String?,
+        refAudio: MLXArray?,
+        refText: String?,
+        language: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double,
+        codebooks: Int
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
         let settings = resolveVoiceDesignGenerationSettings(
             language: language,
@@ -124,6 +166,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 repetitionPenalty: settings.repetitionPenalty,
                 minP: settings.minP,
                 maxTokens: settings.maxTokens,
+                codebooks: codebooks,
                 streamingInterval: streamingInterval,
                 onToken: onToken,
                 onInfo: onInfo,
@@ -135,7 +178,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     public func generate(
         text: String,
         conditioning: Qwen3TTSReferenceConditioning,
-        generationParameters: GenerateParameters
+        generationParameters: GenerateParameters,
+        codebooks: Int = 16
     ) async throws -> MLXArray {
         try requireGenerationComponents()
         let settings = resolveVoiceDesignGenerationSettings(
@@ -155,7 +199,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             topP: settings.topP,
             repetitionPenalty: settings.repetitionPenalty,
             minP: settings.minP,
-            maxTokens: settings.maxTokens
+            maxTokens: settings.maxTokens,
+            codebooks: codebooks
         )
     }
 
@@ -176,7 +221,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         text: String,
         conditioning: Qwen3TTSReferenceConditioning,
         generationParameters: GenerateParameters,
-        streamingInterval: Double
+        streamingInterval: Double,
+        codebooks: Int = 16
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
         let settings = resolveVoiceDesignGenerationSettings(
             language: conditioning.resolvedLanguage,
@@ -196,6 +242,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 repetitionPenalty: settings.repetitionPenalty,
                 minP: settings.minP,
                 maxTokens: settings.maxTokens,
+                codebooks: codebooks,
                 streamingInterval: streamingInterval,
                 onToken: onToken,
                 onInfo: onInfo,
@@ -316,6 +363,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         repetitionPenalty: Float,
         minP: Float,
         maxTokens: Int,
+        codebooks: Int = 16,
         streamingInterval: Double = 2.0,
         onToken: ((Int) -> Void)? = nil,
         onInfo: ((AudioGenerationInfo) -> Void)? = nil,
@@ -390,14 +438,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             .filter { $0 != eosTokenId }
 
         // Streaming decode state
-        let codecTokenRateHz = 12.5
-        let streamingChunkSize = max(1, Int(streamingInterval * codecTokenRateHz))
+        let streamingChunkSize = 3
         var decodedTokens = 0
 
         var trailingIdx = 0
         var inputEmbeds = inputEmbedsInit
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
+
+        // Raw KV cache for compiled path (populated after prefill)
+        var kvPairs = [(MLXArray, MLXArray)]()
+        var kvOffset = 0
+        let useCompiled = false
 
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
@@ -410,8 +462,28 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         for step in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
+
             // Forward pass through talker
-            let (logits, hidden) = talker(inputEmbeds, cache: cache)
+            let logits: MLXArray
+            let hidden: MLXArray
+            if step == 0 {
+                // Prefill: use KVCache path (multi-token input)
+                (logits, hidden) = talker(inputEmbeds, cache: cache)
+                if useCompiled {
+                    kvOffset = cache.first?.offset ?? inputEmbeds.dim(1)
+                    kvPairs = cache.map { c in
+                        let state = c.state
+                        return (state[0], state[1])
+                    }
+                }
+            } else if useCompiled {
+                (logits, hidden) = executeTalkerStep(
+                    embeds: inputEmbeds, offset: kvOffset, kvPairs: &kvPairs
+                )
+                kvOffset += 1
+            } else {
+                (logits, hidden) = talker(inputEmbeds, cache: cache)
+            }
 
             // Sample first codebook token
             let nextToken = sampleToken(
@@ -436,7 +508,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 _ = layerCache.trim(layerCache.offset)
             }
 
-            for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
+            let actualExtra = min(codebooks - 1, talkerConfig.numCodeGroups - 1)
+            for codeIdx in 0 ..< actualExtra {
                 let codeInput: MLXArray
                 if codeIdx == 0 {
                     let code0Embed = talker.getInputEmbeddings()(nextToken)
@@ -459,6 +532,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 codeTokens.append(nextCode)
             }
 
+            while codeTokens.count < talkerConfig.numCodeGroups {
+                codeTokens.append(MLXArray.zeros([1, 1], type: Int32.self))
+            }
+
             let allCodes = concatenated(codeTokens, axis: 1) // [1, num_code_groups]
 
             // Prepare next input
@@ -470,10 +547,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 textEmbed = ttsPadEmbed
             }
 
-            // Sum all code embeddings for next step
+            // Sum code embeddings for predicted codebooks only (not zero-padded ones)
             var codecEmbed = talker.getInputEmbeddings()(nextToken)
-            for (i, code) in codeTokens.dropFirst().enumerated() {
-                codecEmbed = codecEmbed + talker.codePredictor.codecEmbedding[i](code)
+            for i in 0 ..< min(actualExtra, talkerConfig.numCodeGroups - 1) {
+                codecEmbed = codecEmbed + talker.codePredictor.codecEmbedding[i](codeTokens[i + 1])
             }
 
             inputEmbeds = textEmbed + codecEmbed
@@ -503,11 +580,9 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 }
             }
 
-            if step > 0, step % 50 == 0 {
-                Memory.clearCache()
-            }
         }
 
+        Memory.clearCache()
         try Task.checkCancellation()
 
         guard !generatedCodes.isEmpty else {
@@ -1092,6 +1167,164 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return token.reshaped(1, 1)
     }
 
+    // MARK: - Compiled generation step
+
+    /// Set up compiled talker step for Metal kernel fusion.
+    /// Position embeddings (cos/sin from MRoPE) are computed outside the compiled
+    /// function to avoid Slice shape-inference failures during compilation tracing.
+    /// The compiled function only runs: layers (attn + MLP) + norm + codec head.
+    private func setupCompilation() {
+        guard let talkerConfig = config.talkerConfig else { return }
+        let talkerRef = self.talker
+        let numLayers = talkerConfig.numHiddenLayers
+
+        // Inputs: [embeds, cos, sin, signMask, K0, V0, K1, V1, ..., K27, V27]
+        // Outputs: [logits, hidden, K0', V0', K1', V1', ..., K27', V27']
+        compiledTalkerStep = compile(
+            inputs: [talkerRef], outputs: [talkerRef], shapeless: false
+        ) { inputs in
+            let embeds = inputs[0]
+            let cos = inputs[1]
+            let sin = inputs[2]
+            let signMask = inputs[3]
+            let posEmbeddings = (cos, sin)
+
+            var x = embeds
+            var newKVPairs = [(MLXArray, MLXArray)]()
+            for i in 0..<numLayers {
+                let existingK = inputs[4 + i * 2]
+                let existingV = inputs[5 + i * 2]
+                let (out, newK, newV) = talkerRef.model.layers[i].stepWithRawCache(
+                    x,
+                    positionEmbeddings: posEmbeddings,
+                    signMask: signMask,
+                    existingKeys: existingK,
+                    existingValues: existingV
+                )
+                x = out
+                newKVPairs.append((newK, newV))
+            }
+            x = talkerRef.model.norm(x)
+            let logits = talkerRef.codecHead(x)
+
+            var result = [logits, x]
+            for (k, v) in newKVPairs { result.append(k); result.append(v) }
+            return result
+        }
+    }
+
+    /// Execute a talker generation step using the compiled path when available.
+    func executeTalkerStep(
+        embeds: MLXArray,
+        offset: Int,
+        kvPairs: inout [(MLXArray, MLXArray)]
+    ) -> (MLXArray, MLXArray) {
+        guard let talkerConfig = config.talkerConfig else {
+            fatalError("Talker config not loaded")
+        }
+
+        guard let compiled = compiledTalkerStep else {
+            let cache = talker.makeCache()
+            let (logits, hidden) = talker(embeds, cache: cache)
+            return (logits, hidden)
+        }
+
+        // Compute position embeddings outside compiled path (avoids MRoPE Slice issues)
+        let batch = embeds.dim(0)
+        let seqLen = embeds.dim(1)
+        let pos = MLXArray(Int32(offset) ..< Int32(offset + seqLen)).reshaped(1, seqLen)
+        let bpos = broadcast(pos, to: [batch, seqLen])
+        let posIds = stacked([bpos, bpos, bpos], axis: 0)
+        let (cos, sin) = talker.model.rotaryEmb(embeds, positionIds: posIds)
+
+        let signMask = makeRotateHalfSignMask(
+            headDim: talkerConfig.headDim, dtype: embeds.dtype
+        )
+
+        var flatInputs = [embeds, cos, sin, signMask]
+        for (k, v) in kvPairs { flatInputs.append(k); flatInputs.append(v) }
+
+        let out = compiled(flatInputs)
+
+        let numLayers = talkerConfig.numHiddenLayers
+        kvPairs = (0..<numLayers).map { i in
+            (out[2 + i * 2], out[3 + i * 2])
+        }
+        return (out[0], out[1])
+    }
+
+    // MARK: - Warm-up
+
+    func warmUp() {
+        guard let tokenizer, let talkerConfig = config.talkerConfig else { return }
+        let warmUpStart = Date()
+
+        // compile() disabled: shapeless=true fails on Slice/Split in rotateHalf,
+        // shapeless=false recompiles every step (growing KV cache). Needs fixed-size
+        // pre-allocated cache to work. Warmup still runs for Metal shader JIT.
+        // setupCompilation()
+
+        // Minimal prefill through the talker to trigger Metal shader JIT compilation
+        let prepared = prepareGenerationInputs(
+            text: "hi",
+            language: "english",
+            instruct: nil,
+            speaker: nil
+        )
+        let (inputEmbeds, trailingTextHidden, ttsPadEmbed) = prepared
+        eval(inputEmbeds, trailingTextHidden, ttsPadEmbed)
+
+        // Talker prefill (uses KVCache path — only runs once per generation)
+        let cache = talker.makeCache()
+        let (logits, hidden) = talker(inputEmbeds, cache: cache)
+        eval(logits, hidden)
+
+        // Generation step: trace the compiled talker step
+        let warmupEmbed = talker.getInputEmbeddings()(
+            MLXArray([Int32(0)]).reshaped(1, 1)
+        )
+        let prefillLen = inputEmbeds.dim(1)
+
+        if compiledTalkerStep != nil {
+            // Extract raw KV arrays and trace compiled path
+            var kvPairs = cache.map { c in
+                let state = c.state
+                return (state[0], state[1])
+            }
+            let (stepLogits, _) = executeTalkerStep(
+                embeds: warmupEmbed, offset: prefillLen, kvPairs: &kvPairs
+            )
+            eval(stepLogits)
+        } else {
+            let (stepLogits, stepHidden) = talker(warmupEmbed, cache: cache)
+            eval(stepLogits, stepHidden)
+        }
+
+        // Code predictor: compile 5-layer shaders
+        let warmupToken = MLXArray([Int32(0)]).reshaped(1, 1)
+        let codeCache = talker.codePredictor.makeCache()
+        let codeHidden = hidden[0..., (-1)..., 0...]
+        let code0Embed = talker.getInputEmbeddings()(warmupToken)
+        let codeInput = concatenated([codeHidden, code0Embed], axis: 1)
+        let (codeLogits, _, _) = talker.codePredictor(
+            codeInput, cache: codeCache, generationStep: 0
+        )
+        eval(codeLogits)
+
+        // Codec decoder: warm up streaming path
+        if let speechTokenizer {
+            speechTokenizer.decoder.resetStreamingState()
+            let dummyCodes = MLXArray.zeros([1, talkerConfig.numCodeGroups, 3], type: Int32.self)
+            let decoded = speechTokenizer.decoder.streamingStep(dummyCodes)
+            eval(decoded)
+            speechTokenizer.decoder.resetStreamingState()
+        }
+
+        Memory.clearCache()
+        let warmUpTime = Date().timeIntervalSince(warmUpStart)
+        print("Warm-up complete (\(String(format: "%.0f", warmUpTime * 1000))ms)")
+    }
+
     // MARK: - fromPretrained
 
     public static func fromPretrained(
@@ -1214,6 +1447,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         print("Loaded Qwen3-TTS model (\(config.ttsModelType))")
+        model.warmUp()
         return model
     }
 
