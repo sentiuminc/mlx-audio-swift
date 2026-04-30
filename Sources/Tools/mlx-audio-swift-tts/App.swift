@@ -56,7 +56,8 @@ enum App {
                 timestamps: args.timestamps,
                 benchmark: args.benchmark,
                 rawIPA: args.rawIPA,
-                language: args.language
+                language: args.language,
+                codebooks: args.codebooks
             )
         } catch {
             fputs("Error: \(error)\n", stderr)
@@ -79,6 +80,7 @@ enum App {
         benchmark: Bool,
         rawIPA: Bool = false,
         language: String? = nil,
+        codebooks: Int? = nil,
         hfToken: String? = nil
     ) async throws {
         Memory.cacheLimit = 256 * 1024 * 1024
@@ -123,19 +125,39 @@ enum App {
             generationParameters.topP = topP
         }
 
+        if let codebooks {
+            print("Using \(codebooks) codebooks")
+        }
+
+        let qwen3Model = loadedModel as? Qwen3TTSModel
+
         let audioFrames: PCMFrames
         var benchmarkMetrics: BenchmarkMetrics?
         if benchmark {
             let sampleRate = Double(loadedModel.sampleRate)
-            let stream = loadedModel.generateStream(
-                text: text,
-                voice: voice,
-                refAudio: refAudio,
-                refText: refText,
-                language: language,
-                generationParameters: generationParameters,
-                streamingInterval: 0.32
-            )
+            let stream: AsyncThrowingStream<AudioGeneration, Error>
+            if let codebooks, let qwen3Model {
+                stream = qwen3Model.generateStream(
+                    text: text,
+                    voice: voice,
+                    refAudio: refAudio,
+                    refText: refText,
+                    language: language,
+                    generationParameters: generationParameters,
+                    streamingInterval: 0.32,
+                    codebooks: codebooks
+                )
+            } else {
+                stream = loadedModel.generateStream(
+                    text: text,
+                    voice: voice,
+                    refAudio: refAudio,
+                    refText: refText,
+                    language: language,
+                    generationParameters: generationParameters,
+                    streamingInterval: 0.32
+                )
+            }
 
             var collectedAudio = PCMFrames()
             var totalFrames = 0
@@ -174,14 +196,27 @@ enum App {
                 generationInfo: generationInfo
             )
         } else {
-            let audio = try await loadedModel.generate(
-                text: text,
-                voice: voice,
-                refAudio: refAudio,
-                refText: refText,
-                language: language,
-                generationParameters: generationParameters
-            )
+            let audio: MLXArray
+            if let codebooks, let qwen3Model {
+                audio = try await qwen3Model.generate(
+                    text: text,
+                    voice: voice,
+                    refAudio: refAudio,
+                    refText: refText,
+                    language: language,
+                    generationParameters: generationParameters,
+                    codebooks: codebooks
+                )
+            } else {
+                audio = try await loadedModel.generate(
+                    text: text,
+                    voice: voice,
+                    refAudio: refAudio,
+                    refText: refText,
+                    language: language,
+                    generationParameters: generationParameters
+                )
+            }
             audioFrames = try PCMFrames(audio: audio)
         }
 
@@ -430,6 +465,7 @@ struct CLI {
     let benchmark: Bool
     let rawIPA: Bool
     let language: String?
+    let codebooks: Int?
 
     static func parse() throws -> CLI {
         var text: String?
@@ -445,6 +481,7 @@ struct CLI {
         var benchmark = false
         var rawIPA = false
         var language: String? = nil
+        var codebooks: Int? = nil
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let arg = it.next() {
@@ -488,6 +525,10 @@ struct CLI {
             case "--language", "-l":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 language = v
+            case "--codebooks":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let value = Int(v), (1...16).contains(value) else { throw CLIError.invalidValue(arg, v) }
+                codebooks = value
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -517,7 +558,8 @@ struct CLI {
             timestamps: timestamps,
             benchmark: benchmark,
             rawIPA: rawIPA,
-            language: language
+            language: language,
+            codebooks: codebooks
         )
     }
 
@@ -525,7 +567,7 @@ struct CLI {
         let exe = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "marvis-tts-cli"
         print("""
         Usage:
-          \(exe) --text "Hello world" [--voice conversational_b] [--model <hf-repo>] [--output <path>] [--ref_audio <path>] [--ref_text <string>] [--max_tokens <int>] [--temperature <float>] [--top_p <float>] [--timestamps] [--benchmark]
+          \(exe) --text "Hello world" [--voice conversational_b] [--model <hf-repo>] [--output <path>] [--ref_audio <path>] [--ref_text <string>] [--max_tokens <int>] [--temperature <float>] [--top_p <float>] [--codebooks <int>] [--timestamps] [--benchmark]
 
         Options:
           -t, --text <string>           Text to synthesize (required if not passed as trailing arg)
@@ -537,6 +579,7 @@ struct CLI {
               --max_tokens <int>       Maximum number of tokens to generate (overrides model default)
               --temperature <float>    Sampling temperature (overrides model default)
               --top_p <float>          Top-p sampling (overrides model default)
+              --codebooks <int>        Number of codebooks 1-16 (default: 16, use 12 for faster output)
               --timestamps             Emit word timestamps using mlx-community/Qwen3-ForcedAligner-0.6B-4bit
               --benchmark              Run streaming benchmark and log TTFB/RTF metrics
               --raw-ipa                Skip text processing, pass IPA phonemes directly
