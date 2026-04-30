@@ -51,6 +51,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             : nil
     }
 
+    // MARK: - Cache carryover
+
+    /// Mutable container for talker KV cache, used for prosody carryover between sentences.
+    public class TalkerCacheState: @unchecked Sendable {
+        public var cache: [any KVCache]?
+        public init() { self.cache = nil }
+    }
+
     // MARK: - SpeechGenerationModel protocol
 
     public func generate(
@@ -168,6 +176,47 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 maxTokens: settings.maxTokens,
                 codebooks: codebooks,
                 streamingInterval: streamingInterval,
+                onToken: onToken,
+                onInfo: onInfo,
+                onAudioChunk: onAudioChunk
+            )
+        }
+    }
+
+    public func generateStream(
+        text: String,
+        voice: String?,
+        refAudio: MLXArray?,
+        refText: String?,
+        language: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double,
+        codebooks: Int,
+        cacheState: TalkerCacheState?,
+        resetDecoder: Bool
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: language,
+            generationParameters: generationParameters
+        )
+        return makeGenerationStream { model, onToken, onInfo, onAudioChunk in
+            _ = try model.generateVoiceDesign(
+                text: text,
+                instruct: voice,
+                language: settings.language,
+                refAudio: refAudio,
+                refText: refText,
+                temperature: settings.temperature,
+                topK: settings.topK,
+                topP: settings.topP,
+                repetitionPenalty: settings.repetitionPenalty,
+                minP: settings.minP,
+                maxTokens: settings.maxTokens,
+                codebooks: codebooks,
+                streamingInterval: streamingInterval,
+                existingCache: cacheState?.cache,
+                resetDecoder: resetDecoder,
+                cacheOutput: cacheState,
                 onToken: onToken,
                 onInfo: onInfo,
                 onAudioChunk: onAudioChunk
@@ -365,6 +414,9 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         maxTokens: Int,
         codebooks: Int = 16,
         streamingInterval: Double = 2.0,
+        existingCache: [any KVCache]? = nil,
+        resetDecoder: Bool = true,
+        cacheOutput: TalkerCacheState? = nil,
         onToken: ((Int) -> Void)? = nil,
         onInfo: ((AudioGenerationInfo) -> Void)? = nil,
         onAudioChunk: ((MLXArray) -> Void)? = nil
@@ -422,13 +474,13 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refCodes = nil
         }
 
-        // Cap max tokens based on text length
-        let targetTokenCount = tokenizer.encode(text: text).count
-        let effectiveMaxTokens = min(maxTokens, max(75, targetTokenCount * 6))
+        // Cap max tokens based on text length (matching Python server.py word_count * 20)
+        let wordCount = text.split(separator: " ").count
+        let effectiveMaxTokens = min(maxTokens, max(50, wordCount * 20))
 
         // Initialize cache and timing
         let startTime = Date()
-        let cache = talker.makeCache()
+        let cache = existingCache ?? talker.makeCache()
         var generatedCodes = [MLXArray]()
         var generatedCodebookTokens = [Int]()
         let eosTokenId = talkerConfig.codecEosTokenId
@@ -451,13 +503,20 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         var kvOffset = 0
         let useCompiled = compiledTalkerStep != nil
 
-        if onAudioChunk != nil {
+        if onAudioChunk != nil && resetDecoder {
             speechTokenizer.decoder.resetStreamingState()
         }
-        defer {
-            if onAudioChunk != nil {
-                speechTokenizer.decoder.resetStreamingState()
-            }
+
+        // Extended causal mask for KV cache carryover (port of server.py L271-279)
+        var firstCallMask: MLXArray? = nil
+        let cacheOffset = cache.first?.offset ?? 0
+        if cacheOffset > 0 {
+            let seqLen = inputEmbedsInit.dim(1)
+            let totalLen = seqLen + cacheOffset
+            let rows = MLXArray(Int32(0) ..< Int32(seqLen))
+            let cols = MLXArray(Int32(0) ..< Int32(totalLen))
+            let maskBool = cols.reshaped(1, totalLen) .> (rows.reshaped(seqLen, 1) + Int32(cacheOffset))
+            firstCallMask = (maskBool.asType(inputEmbedsInit.dtype) * MLXArray(Float(-1e9)).asType(inputEmbedsInit.dtype))
         }
 
         for step in 0 ..< effectiveMaxTokens {
@@ -468,7 +527,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             let hidden: MLXArray
             if step == 0 {
                 // Prefill: use KVCache path (multi-token input)
-                (logits, hidden) = talker(inputEmbeds, cache: cache)
+                // Pass extended mask for carryover (new tokens attend to cached tokens)
+                (logits, hidden) = talker(inputEmbeds, mask: firstCallMask, cache: cache)
                 if useCompiled {
                     kvOffset = cache.first?.offset ?? inputEmbeds.dim(1)
                     kvPairs = cache.map { c in
@@ -582,7 +642,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         }
 
-        Memory.clearCache()
+        cacheOutput?.cache = cache
+
+        if resetDecoder {
+            Memory.clearCache()
+        }
         try Task.checkCancellation()
 
         guard !generatedCodes.isEmpty else {
