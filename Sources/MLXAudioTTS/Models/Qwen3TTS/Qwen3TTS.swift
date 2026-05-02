@@ -366,10 +366,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         let audioID = ObjectIdentifier(refAudio)
-        print("Got audio ID: '\(audioID)'")
         if let cached = withInputPreparationCacheLock({ cachedReferenceAudioContext }),
            cached.audioID == audioID {
-            print("Returning cached context")
             return cached
         }
 
@@ -1033,9 +1031,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                let spkIdValue = spkIdMap[speaker.lowercased()] {
                 let spkIdArray = MLXArray([Int32(spkIdValue.intValue)]).reshaped(1, 1)
                 speakerEmbed = talker.getInputEmbeddings()(spkIdArray)
-                print("[Qwen3TTS] CustomVoice: speaker '\(speaker)' → spkId=\(spkIdValue.intValue)")
             } else {
-                print("[Qwen3TTS] CustomVoice: WARNING - speaker '\(speaker)' not found in spkId map")
+                print("[warning] speaker '\(speaker)' not found in spkId map")
             }
             if let dialectMap = talkerConfig.spkIsDialect,
                let dialectVal = dialectMap[speaker.lowercased()],
@@ -1043,7 +1040,6 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                let dialectName = dialectVal.dialectName,
                let langMap = talkerConfig.codecLanguageId,
                let dialectLangId = langMap[dialectName] {
-                print("[Qwen3TTS] CustomVoice: dialect override '\(dialectName)' langId=\(dialectLangId)")
                 languageId = dialectLangId
             }
         }
@@ -1070,7 +1066,6 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         )
         if let spkEmbed = speakerEmbed {
             codecEmbed = concatenated([codecEmbed, spkEmbed.reshaped([1, 1, -1]), codecEmbedSuffix], axis: 1)
-            print("[Qwen3TTS] CustomVoice: codec prefix length = \(codecEmbed.dim(1))")
         } else {
             codecEmbed = concatenated([codecEmbed, codecEmbedSuffix], axis: 1)
         }
