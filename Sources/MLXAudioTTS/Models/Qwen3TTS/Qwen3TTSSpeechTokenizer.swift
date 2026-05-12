@@ -942,7 +942,9 @@ final class Qwen3TTSSpeechTokenizerDecoder: Module {
             else if let snake = layer as? DecoderOutputSnake { wav = snake(wav) }
             else if let outConv = layer as? DecoderOutputConv { wav = outConv(wav) }
         }
-        return clip(wav, min: -1, max: 1)
+        let peak = MLX.abs(wav).max()
+        let scale = MLX.minimum(MLXArray(Float(0.9)) / (peak + 1e-6), MLXArray(Float(1.0)))
+        return wav * scale
     }
 
     func resetStreamingState() {
@@ -1002,7 +1004,9 @@ final class Qwen3TTSSpeechTokenizerDecoder: Module {
             wav = outConv.step(wav)
         }
 
-        return clip(wav, min: -1, max: 1)
+        let peak = MLX.abs(wav).max()
+        let scale = MLX.minimum(MLXArray(Float(0.9)) / (peak + 1e-6), MLXArray(Float(1.0)))
+        return wav * scale
     }
 
     func chunkedDecode(_ codes: MLXArray, chunkSize: Int = 300, leftContextSize: Int = 25) -> MLXArray {
